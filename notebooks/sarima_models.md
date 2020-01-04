@@ -1,12 +1,4 @@
----
-title: "SARIMA Models"
-output: 
-  html_document:
-    keep_md: true
----
-
-
-
+# SARIMA Models
 
 ```r
 # Install required libraries if necessary.
