@@ -1,10 +1,4 @@
----
-title: "Uber Trips Analysis"
-output:
-  html_document:
-    keep_md: true
----
-
+# Uber Trips Analysis
 
 
 
