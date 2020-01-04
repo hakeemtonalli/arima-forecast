@@ -1,6 +1,4 @@
-
-
-
+# Final Results
 
 ```r
 library("forecast")
