@@ -1,9 +1,4 @@
----
-title: "Uber Cross-Correlation Analysis"
-output: 
-  html_document:
-    keep_md: true
----
+# Uber Cross-Correlation Analysis
 
 
 
