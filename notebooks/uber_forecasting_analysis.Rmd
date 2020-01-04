@@ -1,0 +1,590 @@
+---
+title: "Uber Trips Analysis"
+output: html_notebook
+---
+
+
+To upload the data, download the `uber_pickups_lower_manhattan_wide_6h.csv` and stick it in a folder and remember the directory. 
+
+```{r}
+# Install required libraries if necessary.
+require("forecast")
+require("lubridate")
+require("gridExtra")
+require("tidyverse")
+require("caret")
+require("tscount")
+```
+
+```{r}
+# Input data
+uber_6h <- read_csv('../data/uber_pickups_lower_manhattan_wide_6h.csv') # Point this to the directory and file
+
+uber_train <- uber_6h %>% filter(Pickup_date < ymd_hms("2015-06-01 00:00:00")) # This gives us a training set for all 8 locations
+uber_test <- uber_6h %>% filter(Pickup_date >= ymd_hms("2015-06-01 00:00:00"))
+uber_train <- uber_train %>% mutate(season=weekdays(Pickup_date, abbreviate=TRUE))
+uber_test <- uber_test %>% mutate(season=weekdays(Pickup_date, abbreviate=TRUE))
+# nrow(uber_6h) # if we want to check number of observations
+# names(uber_6h) # use this command if you want to see the available time series
+train_freq <- ts(uber_train$East_Village, frequency=28)
+test_freq <- ts(uber_test$East_Village, frequency=28)
+```
+
+```{r}
+head(uber_test)
+```
+
+
+## Train-test split
+
+We will use the first five months as training data and predict Uber pickups for June 2015 in the East Village. The date is in positx format which can be parsed using the lubridate package. 
+
+Statistical forecasting techniques are used on the East Village training data, and will be evaluated on East Village test data. 
+
+
+```{r}
+# This block selects only east village data and splits it into train/test sets
+full_ts <- msts(uber_6h$East_Village,
+                    start=decimal_date(ymd_hms("2015-01-01 00:00:00")),
+                    seasonal.periods=c(4, 1461))
+
+train_ts <- msts(uber_train$East_Village,
+                    start=decimal_date(ymd_hms("2015-01-01 00:00:00")),
+                    seasonal.periods=c(4, 1461))
+
+test_ts <- msts(uber_test$East_Village,
+                    start=decimal_date(ymd_hms("2015-06-01 00:00:00")),
+                    seasonal.periods=c(4, 1461))
+
+
+#train_ts <- window(full_ts, start=decimal_date(ymd_hms("2015-01-01 00:00:00"))) # Train with obsercations up until june
+
+#test_ts <- window(full_ts, start=decimal_date(ymd_hms("2015-06-01 00:00:00"))) # Test out predictions with June data
+y_test <- as.numeric(test_ts)
+test_size <- length(y_test)
+```
+
+
+```{r}
+# Show full data set
+p1 <- full_ts %>% autoplot(series="All Trips") + 
+  ggtitle("Full Dataset") +
+  guides(colour=guide_legend("Data"))+
+  scale_color_manual(values=c("black"))
+
+# Show training dataset
+p2 <- autoplot(train_ts, series="Training")+
+  autolayer(test_ts,  series="Validation")+
+  guides(colour=guide_legend("Split"))+
+  scale_color_manual(values=c("black", "grey"))+
+  ggtitle("Train/Test Split")
+
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+To look at any of the other 7 pickup locations, call `lil_italy <- uber_train %>% select(Little_Italy)` for example.
+
+```{r}
+# Show subset of data to look for patterns
+
+jan_to_march <- train_ts %>% window(end=decimal_date(ymd_hms("2015-03-01 00:00:00")))
+
+jan_to_march %>% autoplot()+
+  ggtitle("2 Months of Uber Pickup Data")
+```
+
+
+By aggregating to 6-hour windows we model the demand per "shift" in a day.
+
+- 00:00 - 05:59 - Graveyard Shift
+- 06:00 - 11:59 - Morning Shift
+- 12:00 - 17:59 - Afternoon Shift
+- 18:00 - 23:59 - Evening Shift
+
+## Moving Average Filter
+
+```{r}
+jan <- geom_vline(xintercept = decimal_date(ymd_hms("2015-01-01 00:00:00")), linetype="dashed", color = "blue", size=0.5)
+feb <- geom_vline(xintercept = decimal_date(ymd_hms("2015-02-01 00:00:00")), linetype="dashed", color = "blue", size=0.5)
+mar <- geom_vline(xintercept = decimal_date(ymd_hms("2015-03-01 00:00:00")), linetype="dashed", color = "blue", size=0.5)
+apr <- geom_vline(xintercept = decimal_date(ymd_hms("2015-04-01 00:00:00")), linetype="dashed", color = "blue", size=0.5)
+may <- geom_vline(xintercept = decimal_date(ymd_hms("2015-05-01 00:00:00")), linetype="dashed", color = "blue", size=0.5)
+jun <- geom_vline(xintercept = decimal_date(ymd_hms("2015-06-01 00:00:00")), linetype="dashed", color = "blue", size=0.5)
+
+train_ts %>% autoplot(series="Original Data")+
+  autolayer(ma(train_ts, 4), series="Moving Average")+
+  jan + feb + mar + apr + may + jun + # adding month lines
+  guides(colour=guide_legend("Split"))+
+  scale_color_manual(values=c("black", "grey"))+
+  ggtitle("Moving Average of Training Data")
+
+```
+
+This helps with telling the seasonality of the data. It looks like there is a spike in demand at the beginning of each month. In addition there are about three spikes during each month. This probably corresponds to __weekly spikes in demand__. 
+
+## Analyzing the trend
+
+```{r}
+lm(train_ts ~ time(train_ts)) %>% fitted() -> yhat.lm
+autoplot(train_ts) + 
+  geom_line(mapping=aes(x=time(train_ts), y=yhat.lm), color="red")+
+  ggtitle("Linear Trend Fit")+
+  xlab("Time")+
+  ylab("Pickups")
+```
+
+
+There is a slight linear trend. Let's see what the ACF and PACF plots look like.
+
+
+```{r}
+p1 <- ggAcf(train_ts) + ggtitle("ACF of Uber Pickups")
+p2 <- ggPacf(train_ts) + ggtitle("PACF of Uber Pickups")
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+
+
+Not very informative although it initially hints toward an AR(p) model after a difference. 
+
+Before checking the lag plot, the trend should be removed via differencing.
+
+## Differencing 
+
+```{r}
+# code for differencing the training data
+train_diff <- diff(train_ts)
+lm(train_diff ~ time(train_diff)) %>% fitted() -> yhat.lm
+
+train_diff %>% autoplot() + 
+  geom_line(mapping=aes(x=time(train_diff), y=yhat.lm), color="red") + 
+  ggtitle("Differenced Pickup Data") + 
+  ylab("Change in Pickups")
+```
+
+```{r}
+# Comparison of time series plots
+
+lm(train_ts ~ time(train_ts)) %>% fitted() -> yhat.lm1
+p1 <- autoplot(train_ts) + 
+  geom_line(mapping=aes(x=time(train_ts), y=yhat.lm1), color="red")+
+  ggtitle("Original Data with Linear Fit")+
+  xlab("Time")+
+  ylab("Pickups")
+
+# code for differencing the training data
+train_diff <- diff(train_ts)
+lm(train_diff ~ time(train_diff)) %>% fitted() -> yhat.lm2
+
+p2 <- train_diff %>% autoplot() + 
+  geom_line(mapping=aes(x=time(train_diff), y=yhat.lm2), color="red") + 
+  ggtitle("Differenced Data with Linear Fit") + 
+  ylab("Change in Pickups")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+
+
+## Zoom in
+
+```{r}
+diffwin <- train_diff %>% window(end=decimal_date(ymd_hms("2015-03-01 00:00:00"))) 
+diffwin %>% autoplot() + ggtitle("2 Months of Differenced Pickups")
+```
+
+```{r}
+
+diffwin %>% autoplot(series="Original Data")+
+  autolayer(ma(diffwin, 28), series="Moving Average")+
+  jan + feb + mar +
+  guides(colour=guide_legend("Split"))+
+  scale_color_manual(values=c("black", "grey"))+
+  ggtitle("Moving Average of Training Data (Jan and Feb)")
+```
+
+```{r}
+p1 <- train_diff  %>% ggAcf() + ggtitle("ACF of Differenced Uber Pickups")
+p2 <- train_diff %>% ggPacf() + ggtitle("PACF of Differenced Uber Pickups")
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+
+```{r}
+# ACF of differenced data
+train_diff %>% Acf(plot=FALSE, lag.max=30)
+```
+
+```{r}
+# PACF of differenced data
+train_diff %>% Pacf(plot=FALSE, lag.max=30)
+```
+
+
+There is clear seasonality and a sharp cutoff after lag 26-ish. Each lag is 1 shift, so 24 shifts would be 6 days of pickups, 26 shifts would be 6.5 days of pickups (evening shift of the 6th day). 
+
+In the ACF plot there is a spike at lag 4, and another lower spike at lag 8, lag 12, etc. In addition, there are large spikes at lag 28n. This indicates an AR(4) component and seasonal component at lag 28. The PACF spikes and cuts off after lag 3, and spikes again at lag 28. This further suggests an AR(4) or AR(3) model.
+
+```{r}
+gglagplot(train_diff, set.lags= c(4, 8, 12, 28, 56, 84), do.lines=FALSE, colour=FALSE) + ggtitle("Autocorrelation for different lags: Train Diff")
+```
+
+We looked at the lags for the differenced time series. We suspect that there is a positive autocorrelation at lag 4n because of assumed daily seasonality. The other place to check would be where the ACF's seasonal decay exhibited spikes at lag 28n. Looking at the plot above it's clear that this is a highly predictive lag.
+
+Next we difference the series S=28 times for the D=1 seasonal difference. Here we can see what the order of the seasonal component would be.
+
+```{r}
+train_sdiff <- train_ts %>% diff() %>% diff(lag=28)
+
+p1 <- train_sdiff %>% ggAcf() + ggtitle("ACF of Diff(28) data")
+p2 <- train_sdiff %>% ggPacf() + ggtitle("PACF of Diff(28) data")
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+
+```{r}
+# ACF of seasonal component
+train_ts %>% diff() %>% diff(lag=28) %>% Acf(plot=FALSE, lag.max=30) 
+```
+
+```{r}
+# PACF of seasonal component
+train_ts %>% diff() %>% diff(lag=28) %>% Pacf(plot=FALSE, lag.max=30) 
+```
+
+The ACF and PACF of the seasonal differenced data look very similar. There is a spike at lag 1 and at lag 28 (ACF) and lag 29 (PACF). Besides these two spikes, the rest of the values tend to stick around zero. This is indicative of an SMA(1) seasonal component. There doesn't appear to be any SAR(P) component. Since we took one seasonal difference, then D=1.
+
+We will now __make an ARIMA model based on the ACF and PACF plots of the diff(1) and diff(28)__ version of our original data. 
+
+
+## SARIMA Models
+
+
+The first model is based on the model presented in the time series analysis book mixed with the seasonality that we observe in the Uber dataset. This is a model that is used in economics and was used to predict airline passengers in the book. 
+
+```{r}
+# Intuitive model based on the plots
+m1 <- Arima(train_ts, 
+      order=c(1, 1, 0), 
+      seasonal=list(order=c(0,1,1), period=28))
+
+yhat <- m1 %>% forecast(h=test_size)
+
+# Plot the predictions
+p1 <- yhat %>% autoplot() 
+p2 <- ggAcf(residuals(m1)) + ggtitle("ACF of m1 Residuals")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+
+# Print out summary of the coefficients
+m1 %>% summary()
+
+m1_y <- m1 %>% forecast(h=test_size)
+```
+
+The pattern looks like it was captured in the predictive mean of the forecast, but the prediction intervals get really wide for forecasts beyond about 2 weeks. At this point, the prediction interval captures negative values. 
+
+Next we use p=4 since this is what was uncovered in the ACF and PACF plots of the differenced time series.
+
+
+```{r}
+m2 <- Arima(train_ts, 
+      order=c(4, 1, 0), 
+      seasonal=list(order=c(0,1,1), period=28))
+
+
+m2_y <- m2 %>% forecast(h=test_size)
+
+p1 <- yhat2 %>% autoplot()
+p2 <- ggAcf(residuals(m2)) + ggtitle("ACF of Residuals")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+This second model dips below zero in the prediction interval after the first week. The AIC and BIC of this model are also lower than that of the first economic model.
+
+The last model is one that is chosen by `auto.arima` on the basis of AIC. However, the function needs a time series with frequency defined and I struggled to understand the frequency parameter. I made a guess that it would be the number of days in a year (1 season) divided by the value of the season present in my data.
+
+```{r}
+# Auto arima with forced seasonality
+train_seasonal <- ts(uber_train$East_Village, frequency=365.4/28)
+m_auto <- auto.arima(train_seasonal, D=1) 
+m_auto %>% forecast(h=test_size) %>% autoplot()
+m_auto_y <- m_auto %>% forecast(h=test_size)
+```
+
+```{r}
+m_auto <- Arima(train_ts, 
+      order=c(3, 0, 2), 
+      seasonal=list(order=c(2,1,0), period=13))
+
+m_auto_y <- m_auto %>% forecast(h=test_size)
+```
+
+```{r}
+sfit <- snaive(train_ts) 
+yhat_sfit <- sfit %>% forecast(h=test_size)
+sfit %>% forecast(h=test_size) %>% autoplot()
+```
+
+
+
+This model does worse than the first two. 
+
+```{r}
+# Comparison of model results
+p1 <- ggplot()+
+  geom_point(mapping=aes(x=y_test, y=yhat$mean))+
+  xlim(min(y_test), max(y_test))+
+  ylim(min(y_test), max(y_test))+
+  ggtitle("Actual vs. Predicted (m1)")
+
+p2 <- ggplot()+
+  geom_point(mapping=aes(x=y_test, y=yhat2$mean))+
+  xlim(min(y_test), max(y_test))+
+  ylim(min(y_test), max(y_test))+
+  ggtitle("Actual vs. Predicted (m2)")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+
+```{r}
+m7 <- Arima(train_ts, 
+      order=c(4, 1, 0), 
+      seasonal=list(order=c(0,1,4), period=28))
+
+m7_y <- m7 %>% forecast(h=test_size)
+
+p1 <- yhat7 %>% autoplot()
+p2 <- ggAcf(residuals(m7)) + ggtitle("ACF of Residuals")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+```{r}
+BIC(m2)
+BIC(m7)
+```
+
+```{r}
+m8 <- Arima(train_ts, 
+      order=c(3, 1, 0), 
+      seasonal=list(order=c(0,1,1), period=28))
+
+yhat8 <- m8 %>% forecast(h=test_size)
+
+p1 <- yhat8 %>% autoplot()
+p2 <- ggAcf(residuals(m8)) + ggtitle("ACF of Residuals")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+### Ljung-Box Tests
+
+```{r}
+# Ljung Box tests
+fit_test <- sarima(train_ts, p=4, d=1, q=0, P=0, D=1,  Q=1, S=28)
+
+fit_test
+```
+
+`m1` was pretty good but didn't pass the Ljung-Box test of significance. However `m2` did. And this also assumes normally-distributed errors which isn't exactly true with our data since it's Poisson distributed. 
+
+
+## Poisson Models
+
+```{r}
+# One-hot encoding function for weekly seasonal variable
+dmy <- dummyVars(~season, data = uber_train)
+trainCovariates <- data.frame(predict(dmy ,newdata=data.frame(season=uber_train$season)))
+testCovariates <- data.frame(predict(dmy ,newdata=data.frame(season=uber_test$season)))
+
+# 
+m3 <- tsglm(train_ts, model=list(past_obs=1, past_mean=1), distr="poisson", xreg=trainCovariates)
+
+yhat_m3 <- predict(m3, n.ahead=test_size, newxreg=testCovariates)
+
+predint_m3 <- data.frame(yhat_m3$interval)
+
+ggplot()+
+  geom_line(mapping=aes(x=time(train_ts), y=train_ts))+
+  geom_ribbon(mapping=aes(x=time(test_ts), ymin=predint_m3$lower, ymax = predint_m3$upper), fill="blue", alpha=0.5)+
+  geom_line(mapping=aes(x=time(test_ts), y=yhat_m3$median), color="blue")+
+  ggtitle("Poisson GLM with ARMA(1,1) and Weekday Dummy Variable")
+```
+
+```{r}
+m4 <- tsglm(train_ts, model=list(past_obs=1, past_mean=1), distr="poisson")
+
+yhat_m4 <- predict(m4, n.ahead=test_size)
+
+predint_m4 <- data.frame(yhat_m4$interval)
+
+ggplot()+
+  geom_line(mapping=aes(x=time(train_ts), y=train_ts))+
+  geom_ribbon(mapping=aes(x=time(test_ts), ymin=predint_m4$lower, ymax = predint_m4$upper), fill="blue", alpha=0.5)+
+  geom_line(mapping=aes(x=time(test_ts), y=yhat_m4$median), color="blue")+
+  ggtitle("Poisson GLM with ARMA(1,1)")
+```
+
+```{r}
+
+m5 <- tsglm(train_ts, model=list(past_obs=28, past_mean=1), distr="poisson")
+
+yhat_m5 <- predict(m5, n.ahead=test_size)
+
+predint_m5 <- data.frame(yhat_m5$interval)
+
+mean((y_test - yhat_m5$median)^2)
+
+ggplot()+
+  geom_line(mapping=aes(x=time(train_ts), y=train_ts))+
+  geom_ribbon(mapping=aes(x=time(test_ts), ymin=predint_m5$lower, ymax = predint_m5$upper), fill="blue", alpha=0.5)+
+  geom_line(mapping=aes(x=time(test_ts), y=yhat_m5$median), color="blue")+
+  ggtitle("Poisson GLM with ARMA(28,1)")
+
+m13 <- tsglm(train_ts, model=list(past_obs=28, past_mean=28), distr="poisson")
+
+yhat_m6 <- predict(m13, n.ahead=test_size)
+
+predint_m6 <- data.frame(yhat_m6$interval)
+
+mean((y_test - yhat_m6$median)^2)
+
+ggplot()+
+  geom_line(mapping=aes(x=time(train_ts), y=train_ts))+
+  geom_ribbon(mapping=aes(x=time(test_ts), ymin=predint_m6$lower, ymax = predint_m6$upper), fill="blue", alpha=0.5)+
+  geom_line(mapping=aes(x=time(test_ts), y=yhat_m6$median), color="blue")+
+  ggtitle("Poisson GLM with ARMA(28,28)")
+```
+
+```{r}
+dmy <- dummyVars(~season, data = uber_train)
+trainCovariates <- data.frame(predict(dmy ,newdata=data.frame(season=uber_train$season)))
+testCovariates <- data.frame(predict(dmy ,newdata=data.frame(season=uber_test$season)))
+
+m6 <- tsglm(train_ts, model=list(past_obs=4, past_mean=1), distr="poisson", xreg=trainCovariates)
+predint_m6 <- data.frame(yhat_m6$interval)
+
+yhat_m6 <- predict(m6, n.ahead=test_size, newxreg=testCovariates)
+
+ggplot()+
+  geom_line(mapping=aes(x=time(train_ts), y=train_ts))+
+  geom_ribbon(mapping=aes(x=time(test_ts), ymin=predint_m6$lower, ymax = predint_m6$upper), fill="blue", alpha=0.5)+
+  geom_line(mapping=aes(x=time(test_ts), y=yhat_m6$median), color="blue")+
+  ggtitle("Poisson GLM ARMA(4,1) and Weekday Dummy Variable")
+```
+
+
+That works, should I include the AIC / BIC tables up here too? And the residuals plots and stuff? Alrighty, if you could just put an example section with your model and I can just copy the same format. I have plenty of BS I can stick in d:
+
+Jk im gonna delete this so we have space haha but I'll copy it in a separate texct file
+Could you include a quick writeup on it? I was gonna write up something quick about SARIMA, and William is gonna write up something about Poisson. Sounds good, would you be down to put it up here? We were trying to think of what to put up in this section (unless you have an idea of what to put . Sounds good
+
+
+Our analysis considered three models:\\
+thats right, and multivariate generalized additive models, or VGAM's.Sure, ill do a write up in the model fitting section, ill type out the actual models mathematically and try to explain them. yea i can write it here instead, for model fitting and validation put plots of your forecast beside the validation and talk about how well they fit the data. also probably include tables with the models and errors on the validation set. Yes, and the ljung box stuff too, the procedures you used to choose the best model should be there like the aic, but lets not go too crazy lol. I think at most we include validation error, aic, residual or Q-Q plots, and ljung box should be good. for sure, alright have fun lol
+
+```{r}
+train_freq <- ts(uber_train$East_Village, frequency=28)
+test_freq <- ts(uber_test$East_Village, frequency=28)
+
+train_freq %>% auto.arima() -> m10
+
+p1 <- m10 %>% forecast(h=120) %>% autoplot()
+p2 <- m10 %>% residuals() %>% ggAcf() + ggtitle("ACF of Residuals")
+
+grid.arrange(p1, p2, nrow=1, ncol=2)
+```
+
+```{r}
+checkresiduals(m10)
+```
+
+```{r}
+naives_m <- Arima(train_ts, 
+      order=c(0, 0, 0), 
+      seasonal=list(order=c(0,1,0), period=28))
+
+sfit <- train_ts %>% snaive(m=28) 
+p1 <- naives_m %>% forecast(h=test_size) %>% autoplot(PI=FALSE)
+p2 <- sfit %>% forecast(h=test_size) %>% autoplot()
+
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+```{r}
+sfit <- snaive(train_ts) 
+yhat_sfit <- sfit %>% forecast(h=test_size)
+sfit %>% forecast(h=test_size) %>% autoplot()
+```
+
+## Accuracy Measures
+
+```{r}
+# SARIMA models
+m1 <- Arima(train_ts, 
+      order=c(1, 1, 0), 
+      seasonal=list(order=c(0,1,1), period=28))
+
+m2 <- Arima(train_ts, 
+      order=c(4, 1, 0), 
+      seasonal=list(order=c(0,1,1), period=28))
+
+m3 <- Arima(train_ts, 
+      order=c(4, 1, 0), 
+      seasonal=list(order=c(0,1,4), period=28))
+
+m4 <- Arima(train_ts, 
+      order=c(3, 0, 2), 
+      seasonal=list(order=c(2,1,0), period=13))
+
+m5 <- Arima(train_ts, 
+      order=c(4, 0, 0), 
+      seasonal=list(order=c(2,1,0), period=28))
+
+s_naive <- Arima(train_ts, 
+      order=c(0, 0, 0), 
+      seasonal=list(order=c(0,1,0), period=28))
+
+
+yhat_m1 <- m1 %>% forecast(h=test_size)
+yhat_m2 <- m2 %>% forecast(h=test_size)
+yhat_m3 <- m3 %>% forecast(h=test_size)
+yhat_m4 <- m4 %>% forecast(h=test_size)
+yhat_m5 <- m5 %>% forecast(h=test_size)
+yhat_naive <- s_naive %>% forecast(h=test_size)
+```
+
+
+```{r}
+accuracy(yhat_m1, test_ts)
+accuracy(yhat_m2, test_ts)
+accuracy(yhat_m3, test_ts)
+accuracy(yhat_m4, test_ts)
+accuracy(yhat_m5, test_ts)
+accuracy(yhat_naive, test_ts)
+```
+
+```{r}
+# 
+mse_tsglm1 <- mean((y_test - yhat_m5$median)^2)
+mse_tsglm28 <- mean((y_test - yhat_m6$median)^2)
+
+mae_tsglm1 <- mean(abs(y_test - yhat_m5$median))
+mae_tsglm28 <- mean(abs(y_test - yhat_m6$median))
+
+mse_tsglm1
+mse_tsglm28
+mae_tsglm1
+mae_tsglm28
+
+```
+
+```{r}
+
+
+
+```
+
