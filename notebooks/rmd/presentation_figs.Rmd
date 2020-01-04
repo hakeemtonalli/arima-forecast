@@ -1,0 +1,215 @@
+---
+title: "Uber Trips Analysis"
+output:
+  html_document:
+    keep_md: true
+---
+
+```{r global_options, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(
+  fig.width=12, 
+  fig.height=8, 
+  fig.path = "notebook_figures/pres-",
+  warning=FALSE, 
+  message=FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(gridExtra)
+library(forecast)
+```
+
+```{r}
+uber_1h <- read_csv('../../data/uber_pickups_lower_manhattan_wide_1h.csv')
+uber_6h <- read_csv('../../data/uber_pickups_lower_manhattan_wide_6h.csv')
+```
+
+```{r}
+head(uber_1h)
+head(uber_6h)
+```
+
+```{r}
+nrow(uber_1h)
+nrow(uber_6h)
+```
+
+```{r}
+max(uber_1h$Pickup_date)
+```
+
+```{r}
+str(uber_1h)
+```
+
+## Train-test split
+
+We will use the first five months as training data and predict Uber pickups for June 2015 in the East Village. The date is in positx format which can be parsed using the lubridate package. 
+
+Statistical forecasting techniques are used on the East Village training data, and will be evaluated on East Village test data. 
+
+```{r}
+# Split dataset into two time windows.
+train_full_1h <- uber_1h %>% filter(Pickup_date < ymd_hms("2015-06-01 00:00:00"))
+test_full_1h <- uber_1h %>% filter(Pickup_date >= ymd_hms("2015-06-01 00:00:00"))
+
+# Split the 6-hour interval dataset to train/test
+train_full_6h <- uber_6h %>% filter(Pickup_date < ymd_hms("2015-06-01 00:00:00"))
+test_full_6h <- uber_6h %>% filter(Pickup_date >= ymd_hms("2015-06-01 00:00:00"))
+```
+
+
+
+## Convert to time series format
+
+Next we will turn the train and test datasets into time series.
+
+```{r}
+full_ts <- msts(uber_6h$East_Village,
+                    start=decimal_date(ymd_hms("2015-01-01 00:00:00")),
+                    seasonal.periods=c(4, 1461))
+
+train_ts <- window(full_ts, end=decimal_date(ymd_hms("2015-06-01 00:00:00")))
+
+test_ts <- window(full_ts, start=decimal_date(ymd_hms("2015-06-01 00:00:00")))
+```
+
+
+```{r}
+p1 <- full_ts %>% autoplot(series="All Trips") + 
+  ggtitle("Full Dataset") +
+  guides(colour=guide_legend("Data"))+
+  scale_color_manual(values=c("black"))
+  
+p2 <- autoplot(train_ts, series="Training")+
+  autolayer(test_ts,  series="Validation")+
+  guides(colour=guide_legend("Split"))+
+  scale_color_manual(values=c("black", "grey"))+
+  ggtitle("Train/Test Split")
+
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+
+
+```{r}
+ev <- train_full_1h %>% select(Pickup_date, East_Village) 
+ggplot(ev)+
+  geom_line(mapping=aes(x=Pickup_date, y=East_Village))+
+  ggtitle("Hourly Uber Pickup Data")
+```
+
+```{r}
+
+ev_6 <- train_full_6h %>% select(Pickup_date, East_Village) 
+ggplot(ev_6)+
+  geom_line(mapping=aes(x=Pickup_date, y=East_Village))+
+  ggtitle("Hourly Uber Pickup Data (6 hour windows)")
+```
+```{r}
+ev_jan <- train_full_1h %>% select(Pickup_date, East_Village) %>% filter(Pickup_date < ymd_hms("2015-03-01 00:00:00")) 
+ev_6_jan <- train_full_6h %>% select(Pickup_date, East_Village) %>% filter(Pickup_date < ymd_hms("2015-03-01 00:00:00")) 
+
+p1 <- ggplot(ev_jan)+
+  geom_line(mapping=aes(x=Pickup_date, y=East_Village))+
+  ggtitle("Hourly Uber Pickup Data (1 hour windows)")
+
+p2 <- ggplot(ev_6_jan)+
+  geom_line(mapping=aes(x=Pickup_date, y=East_Village))+
+  ggtitle("Hourly Uber Pickup Data (6 hour windows)")
+
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+
+It looks like the 6 hour windows are better. We can use this data and model the demand per "shift" in a day.
+
+- 12:00am - 5:59am - Graveyard Shift
+- 6:00am - 11:59am - Morning Shift
+- 12:00pm - 5:59pm - Afternoon Shift
+- 6:00pm - 11:59pm - Evening Shift
+
+Note that `train_full_1h`  and `train_full_6h` has the other time series for cross-correlation analysis. We do not need `test_full_1h` or `test_full_6h` anymore.
+
+
+## Moving Average Filter
+
+```{r ma_train}
+train_ts %>% autoplot(series="Original Data")+
+  autolayer(ma(train_ts, 4), series="Moving Average")+
+  guides(colour=guide_legend("Split"))+
+  scale_color_manual(values=c("black", "grey"))+
+  ggtitle("Moving Average of Training Data")
+```
+
+This helps with telling the seasonality of the data.
+
+## Autocorrelation and Partial Autocorrelation
+
+```{r acf_train}
+p1 <- ggAcf(train_ts)
+p2 <- ggPacf(train_ts)
+grid.arrange(p1, p2, nrow=2, ncol=1)
+```
+
+
+Doesn't look stationary. Is there a trend?
+
+```{r trend}
+lm(train_ts ~ time(train_ts)) %>% fitted() -> yhat.lm
+autoplot(train_ts) + 
+  geom_line(mapping=aes(x=time(train_ts), y=yhat.lm), color="red")+
+  ggtitle("Linear Trend Fit")+
+  xlab("Time")+
+  ylab("Pickups")
+```
+
+There is a slight linear trend. 
+
+## Differencing 
+
+```{r diff_ts}
+train_diff <- diff(train_ts)
+
+train_diff %>% autoplot() + ggtitle("Differenced Pickup Data") + ylab("Change in Pickups")
+```
+
+```{r diff_acf}
+ggAcf(train_diff)
+```
+
+
+
+## Zoom in
+
+```{r diff_win}
+diffwin <- train_diff %>% window(end=decimal_date(ymd_hms("2015-03-01 00:00:00"))) 
+diffwin %>% autoplot() + ggtitle("Differenced Pickups from January to March 2015")
+```
+
+```{r ma_win}
+month_line <- geom_vline(xintercept = decimal_date(ymd_hms("2015-02-01 00:00:00")), linetype="dashed", 
+                color = "blue", size=0.5)
+
+diffwin %>% autoplot(series="Original Data")+
+  autolayer(ma(diffwin, 4), series="Moving Average")+
+  month_line + 
+  guides(colour=guide_legend("Split"))+
+  scale_color_manual(values=c("black", "grey"))+
+  ggtitle("Moving Average of Training Data")
+```
+
+```{r diff_acf_win}
+train_diff %>% window(end=decimal_date(ymd_hms("2015-03-01 00:00:00"))) %>% ggAcf()
+```
+
+```{r diff_pacf}
+train_diff %>% window(end=decimal_date(ymd_hms("2015-03-01 00:00:00"))) %>% ggPacf()
+```
+
+There is clear seasonality and a sharp cutoff after lag 26-ish. Each lag is 1 shift, so 24 shifts would be 6 days of pickups, 26 shifts would be 6.5 days of pickups (evening shift of the 6th day).
+
+
