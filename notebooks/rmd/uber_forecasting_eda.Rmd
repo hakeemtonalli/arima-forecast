@@ -9,7 +9,7 @@ output:
 knitr::opts_chunk$set(
   fig.width=12, 
   fig.height=8, 
-  fig.path = "notebook_figures/eda-",
+  fig.path = "figures/eda-",
   warning=FALSE, 
   message=FALSE)
 ```
